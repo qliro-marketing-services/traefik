@@ -1198,6 +1198,16 @@ func (s *Server) loadConfig(configurations types.Configurations, globalConfigura
 						}
 					}
 
+					if frontend.Auth != nil {
+						authMiddleware, err := mauth.NewAuthenticator(frontend.Auth, s.tracingMiddleware)
+						if err != nil {
+							log.Errorf("Error creating Auth: %s", err)
+						} else {
+							n.Use(s.wrapNegroniHandlerWithAccessLog(authMiddleware, fmt.Sprintf("Auth for %s", frontendName)))
+
+						}
+					}
+
 					if config.Backends[frontend.Backend].Buffering != nil {
 						bufferedLb, err := s.buildBufferingMiddleware(lb, config.Backends[frontend.Backend].Buffering)
 
