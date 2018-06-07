@@ -668,6 +668,164 @@ func TestServerLoadConfigEmptyBasicAuth(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestServerGenericFrontendAuthFail(t *testing.T) {
+	globalConfig := configuration.GlobalConfiguration{
+		EntryPoints: configuration.EntryPoints{
+			"http": &configuration.EntryPoint{ForwardedHeaders: &configuration.ForwardedHeaders{Insecure: true}},
+		},
+	}
+
+	dynamicConfigs := types.Configurations{
+		"config": &types.Configuration{
+			Frontends: map[string]*types.Frontend{
+				"frontend": {
+					EntryPoints: []string{"http"},
+					Backend:     "backend",
+					BasicAuth:   []string{""},
+				},
+			},
+			Backends: map[string]*types.Backend{
+				"backend": {
+					Servers: map[string]types.Server{
+						"server": {
+							URL: "http://localhost",
+						},
+					},
+					LoadBalancer: &types.LoadBalancer{
+						Method: "Wrr",
+					},
+				},
+			},
+		},
+	}
+
+	srv := NewServer(globalConfig, nil, nil)
+	_, err := srv.loadConfig(dynamicConfigs, globalConfig)
+	require.NoError(t, err)
+
+}
+func TestServerGenericFrontendAuth(t *testing.T) {
+	const requestProtectedPath = "/protected_path"
+	const routeRuleProtected = "Path:" + requestProtectedPath
+
+	const requestUnProtectedPath = "/unprotected_path"
+	const routeRuleUnProtected = "Path:" + requestUnProtectedPath
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer testServer.Close()
+
+	globalConfig := configuration.GlobalConfiguration{}
+	entryPointsConfig := map[string]EntryPoint{
+		"http": {Configuration: &configuration.EntryPoint{ForwardedHeaders: &configuration.ForwardedHeaders{Insecure: true}}},
+	}
+	dynamicConfigs := types.Configurations{
+		"protected": th.BuildConfiguration(
+			th.WithFrontends(
+				th.WithFrontend("backend",
+					th.WithFrontendName("frontend_protected"),
+					th.WithEntryPoints("http"),
+					th.WithRoutes(th.WithRoute(requestProtectedPath, routeRuleProtected)),
+					th.WithFrontEndAuth(
+						&types.Auth{
+							Basic: &types.Basic{
+								Users: []string{"test:$apr1$H6uskkkW$IgXLP6ewTrSuBkTrqE8wj/"},
+							},
+							Digest:  nil,
+							Forward: nil})),
+				th.WithFrontend("backend",
+					th.WithEntryPoints("http"),
+					th.WithFrontendName("frontend_unprotected"),
+					th.WithRoutes(th.WithRoute(requestUnProtectedPath, routeRuleUnProtected)),
+				),
+			),
+			th.WithBackends(th.WithBackendNew("backend",
+				th.WithLBMethod("wrr"),
+				th.WithServersNew(th.WithServerNew(testServer.URL)),
+			)),
+		),
+	}
+	srv := NewServer(globalConfig, nil, entryPointsConfig)
+	entryPoints, err := srv.loadConfig(dynamicConfigs, globalConfig)
+	if err != nil {
+		t.Fatalf("error loading config: %s", err)
+	}
+
+	// StatusUnauthorized when no password is provided
+	responseRecorder := &httptest.ResponseRecorder{}
+	request := httptest.NewRequest(http.MethodGet, testServer.URL+requestProtectedPath, nil)
+	entryPoints["http"].httpRouter.ServeHTTP(responseRecorder, request)
+	assert.Equal(t, http.StatusUnauthorized, responseRecorder.Result().StatusCode, "status code")
+
+	// Non protected routes should be unaffected
+	responseRecorder = &httptest.ResponseRecorder{}
+	request = httptest.NewRequest(http.MethodGet, testServer.URL+requestUnProtectedPath, nil)
+	entryPoints["http"].httpRouter.ServeHTTP(responseRecorder, request)
+	assert.Equal(t, http.StatusOK, responseRecorder.Result().StatusCode, "status code")
+
+	// Normal response with correct password
+	responseRecorder = &httptest.ResponseRecorder{}
+	request = httptest.NewRequest(http.MethodGet, testServer.URL+requestProtectedPath, nil)
+	request.SetBasicAuth("test", "test")
+	entryPoints["http"].httpRouter.ServeHTTP(responseRecorder, request)
+	assert.Equal(t, http.StatusOK, responseRecorder.Result().StatusCode, "status code")
+}
+
+func TestServerBasicAndGenericFrontendAuth(t *testing.T) {
+	const requestProtectedPath = "/protected_path"
+	const routeRuleProtected = "Path:" + requestProtectedPath
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer testServer.Close()
+
+	globalConfig := configuration.GlobalConfiguration{}
+	entryPointsConfig := map[string]EntryPoint{
+		"http": {Configuration: &configuration.EntryPoint{ForwardedHeaders: &configuration.ForwardedHeaders{Insecure: true}}},
+	}
+	dynamicConfigs := types.Configurations{
+		"protected": th.BuildConfiguration(
+			th.WithFrontends(
+				th.WithFrontend("backend",
+					th.WithFrontendName("frontend0"),
+					th.WithEntryPoints("http"),
+					th.WithRoutes(th.WithRoute(requestProtectedPath, routeRuleProtected)),
+					th.WithFrontEndAuth(
+						&types.Auth{
+							Basic: &types.Basic{
+								Users: []string{"test:$apr1$H6uskkkW$IgXLP6ewTrSuBkTrqE8wj/"},
+							},
+							Digest:  nil,
+							Forward: nil})),
+			),
+			th.WithBackends(th.WithBackendNew("backend",
+				th.WithLBMethod("wrr"),
+				th.WithServersNew(th.WithServerNew(testServer.URL)),
+			)),
+		),
+	}
+	srv := NewServer(globalConfig, nil, entryPointsConfig)
+	entryPoints, err := srv.loadConfig(dynamicConfigs, globalConfig)
+	if err != nil {
+		t.Fatalf("error loading config: %s", err)
+	}
+
+	// Unauthorized response without password when BasicAuth & Auth.BasicAuth is used
+	responseRecorder := &httptest.ResponseRecorder{}
+	request := httptest.NewRequest(http.MethodGet, testServer.URL+requestProtectedPath, nil)
+	entryPoints["http"].httpRouter.ServeHTTP(responseRecorder, request)
+	assert.Equal(t, http.StatusUnauthorized, responseRecorder.Result().StatusCode, "status code")
+
+	// Normal response with correct password when BasicAuth & Auth.BasicAuth is used
+	responseRecorder = &httptest.ResponseRecorder{}
+	request = httptest.NewRequest(http.MethodGet, testServer.URL+requestProtectedPath, nil)
+	request.SetBasicAuth("test", "test")
+	entryPoints["http"].httpRouter.ServeHTTP(responseRecorder, request)
+	assert.Equal(t, http.StatusOK, responseRecorder.Result().StatusCode, "status code")
+}
+
 func TestServerLoadCertificateWithDefaultEntryPoint(t *testing.T) {
 	globalConfig := configuration.GlobalConfiguration{
 		DefaultEntryPoints: []string{"http", "https"},
